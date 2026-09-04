@@ -23,7 +23,7 @@ class _Bubble(QFrame):
         color = "#FFFFFF" if mine else theme.TEXT_MAIN
         self.setObjectName("bubble")
         self.setStyleSheet(
-            f"#bubble {{ background: {bg}; border-radius: 14px; }}"
+            f"#bubble {{ background: {bg}; border-radius: 14px; padding: 8px; }}"
         )
 
         lbl = QLabel(text, self)
@@ -42,7 +42,6 @@ class _Bubble(QFrame):
         # Выравнивание: юзер справа, Элеонора слева
         align = Qt.AlignRight if mine else Qt.AlignLeft
         self.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
-        self._parent_layout = None
         self._align = align
 
     def sizeHint(self):
@@ -84,6 +83,13 @@ class ChatWidget(QScrollArea):
         # Прокрутка вниз после отрисовки
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def clear_messages(self) -> None:
+        """Очистить все сообщения в чате."""
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
     def _scroll_to_bottom(self) -> None:
         bar = self.verticalScrollBar()

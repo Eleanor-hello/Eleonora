@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -66,6 +67,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Eleonora v3")
         self.resize(950, 700)
         self.setStyleSheet(f"background: {theme.BG};")
+
+        self.current_session_id = None
 
         self.llm = LLMClient(
             host=LLM_HOST,
@@ -129,6 +132,32 @@ class MainWindow(QMainWindow):
         # Строка ввода
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
+
+        # Кнопка нового диалога
+        self.new_chat_btn = QPushButton("➕")
+        self.new_chat_btn.setFixedSize(44, 44)
+        self.new_chat_btn.setCursor(Qt.PointingHandCursor)
+        self.new_chat_btn.setToolTip("Новый диалог")
+        self.new_chat_btn.clicked.connect(self._on_new_chat)
+        self.new_chat_btn.setStyleSheet(
+            f"QPushButton {{ background: {theme.SURFACE}; color: white;"
+            f" border: 1px solid {theme.PURPLE}; border-radius: 22px; font-size: 16px; }}"
+            f"QPushButton:hover {{ background: {theme.BORDER}; }}"
+        )
+        input_row.addWidget(self.new_chat_btn)
+
+        # Кнопка истории чатов
+        self.history_btn = QPushButton("📜")
+        self.history_btn.setFixedSize(44, 44)
+        self.history_btn.setCursor(Qt.PointingHandCursor)
+        self.history_btn.setToolTip("История диалогов")
+        self.history_btn.clicked.connect(self._show_history_menu)
+        self.history_btn.setStyleSheet(
+            f"QPushButton {{ background: {theme.SURFACE}; color: white;"
+            f" border: 1px solid {theme.PURPLE}; border-radius: 22px; font-size: 16px; }}"
+            f"QPushButton:hover {{ background: {theme.BORDER}; }}"
+        )
+        input_row.addWidget(self.history_btn)
 
         # Кнопка логов
         self.log_btn = QPushButton("📋")
@@ -213,7 +242,7 @@ class MainWindow(QMainWindow):
         logger.info(f"[чат] пользователь: {text[:80]}")
         self.input_field.clear()
         self.chat.add_message(text, mine=True)
-        chat_repo.add_message("user", text)
+        chat_repo.add_message("user", text, session_id=self.current_session_id)
 
         self._set_busy(True)
         self._set_status("Элеонора думает...")
@@ -221,9 +250,16 @@ class MainWindow(QMainWindow):
         system = SYSTEM_PROMPT.format(
             datetime=datetime.now().strftime("%Y-%m-%d %H:%M")
         )
+        
+        # Если есть активная сессия - загружаем контекст из неё, иначе - общие последние сообщения
+        if self.current_session_id is not None:
+            context_messages = chat_repo.get_session_messages(self.current_session_id)
+        else:
+            context_messages = chat_repo.get_recent(HISTORY_MESSAGES)
+        
         context = [
             {"role": m.role, "content": m.content}
-            for m in chat_repo.get_recent(HISTORY_MESSAGES)
+            for m in context_messages[-HISTORY_MESSAGES:]  # Берём последние HISTORY_MESSAGES
         ]
 
         self.worker = ResponseWorker(
@@ -241,13 +277,13 @@ class MainWindow(QMainWindow):
         logger.info(f"[stress_check] сохранено в базу ударений: {bare_word}")
         response = f"Запомнила, буду говорить {bare_word}"
         self.chat.add_message(response, mine=False)
-        chat_repo.add_message("assistant", response)
+        chat_repo.add_message("assistant", response, session_id=self.current_session_id)
         self._finish()
 
     def _on_response(self, text: str):
         logger.info(f"[чат] Элеонора: {text[:80]}")
         self.chat.add_message(text, mine=False)
-        chat_repo.add_message("assistant", text)
+        chat_repo.add_message("assistant", text, session_id=self.current_session_id)
         if self.tts and self.tts_enabled:
             self.tts.speak(text)   # неблокирующий
         self._finish()
@@ -264,6 +300,83 @@ class MainWindow(QMainWindow):
         self.input_field.setFocus()
 
     # ── Утилиты ──
+
+    def _on_new_chat(self):
+        """Начать новый диалог (создать новую сессию)."""
+        # Сохраняем текущую сессию если есть
+        if self.current_session_id is not None:
+            logger.info(f"Завершена сессия: {self.current_session_id}")
+        
+        # Создаём новую сессию
+        self.current_session_id = chat_repo.create_session()
+        
+        # Очищаем UI чата
+        self.chat.clear_messages()
+        
+        # Загружаем сообщения новой сессии (их пока нет)
+        messages = chat_repo.get_session_messages(self.current_session_id)
+        for msg in messages:
+            self.chat.add_message(msg.content, mine=(msg.role == "user"))
+        
+        self._set_status("Новый диалог создан")
+        logger.info(f"Создан новый диалог, сессия id={self.current_session_id}")
+
+    def _show_history_menu(self):
+        """Показать меню с историей диалогов."""
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: {theme.SURFACE}; color: {theme.TEXT_MAIN};"
+            f" border: 1px solid {theme.PURPLE}; border-radius: 8px; }}"
+            f"QMenu::item {{ padding: 8px 16px; }}"
+            f"QMenu::item:hover {{ background: {theme.PURPLE}; }}"
+        )
+        
+        sessions = chat_repo.get_all_sessions()
+        
+        if not sessions:
+            no_history_action = menu.addAction("Нет сохранённых диалогов")
+            no_history_action.setEnabled(False)
+        else:
+            for session in sessions[:20]:  # Показываем последние 20
+                title = session["title"] or f"Диалог #{session['id']}"
+                updated = session["updated_at"][:16] if session["updated_at"] else ""
+                action_text = f"{title} ({updated})"
+                
+                action = menu.addAction(action_text)
+                action.triggered.connect(lambda checked, sid=session["id"]: self._load_session(sid))
+            
+            menu.addSeparator()
+            
+            # Кнопка удаления выбранной сессии
+            delete_action = menu.addAction("Удалить выбранный диалог")
+            delete_action.triggered.connect(self._delete_current_session)
+        
+        # Позиционируем меню над кнопкой
+        menu.exec_(self.history_btn.mapToGlobal(self.history_btn.rect().bottomLeft()))
+
+    def _load_session(self, session_id: int):
+        """Загрузить указанную сессию в чат."""
+        self.current_session_id = session_id
+        self.chat.clear_messages()
+        
+        messages = chat_repo.get_session_messages(session_id)
+        for msg in messages:
+            self.chat.add_message(msg.content, mine=(msg.role == "user"))
+        
+        self._set_status(f"Загружен диалог: {session_id}")
+        logger.info(f"Загружена сессия: {session_id}")
+
+    def _delete_current_session(self):
+        """Удалить текущую сессию."""
+        if self.current_session_id is None:
+            return
+        
+        session_id = self.current_session_id
+        chat_repo.delete_session(session_id)
+        self.current_session_id = None
+        self.chat.clear_messages()
+        self._set_status("Диалог удалён")
+        logger.info(f"Удалена сессия: {session_id}")
 
     def _set_busy(self, busy: bool):
         self.input_field.setEnabled(not busy)
