@@ -1,0 +1,8 @@
+{
+  "name": "Eleonora",
+  "description": "AI companion with chat, memory search, stress correction, speech synthesis, and agent telemetry",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
