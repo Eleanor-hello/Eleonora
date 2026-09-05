@@ -3,6 +3,8 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import { detectStressFast, looksLikeStressRequest } from './src/lib/stress_detector.js';
+import { classifyTaskFast, TASK_METADATA, TaskType } from './src/lib/task_classifier.js';
+import { getReasoningInstructionForTask, solveReasoningLocally, ReasoningChainResult } from './src/lib/reasoning_engine.js';
 
 interface MessageRecord {
   id: number;
@@ -10,6 +12,10 @@ interface MessageRecord {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  taskCommand?: string;
+  taskNameRu?: string;
+  reasoning?: string;
+  verdict?: string;
 }
 
 interface SessionRecord {
@@ -315,12 +321,141 @@ async function startServer() {
     res.json(systemLogs);
   });
 
-  // ── Main Chat Pipeline ──
-  app.post('/api/chat', async (req, res) => {
-    const { text, sessionId } = req.body;
-    if (!text || typeof text !== 'string') {
-      return res.status(400).json({ error: 'Текст сообщения не указан' });
+  // ── Engine & llama.cpp Config API ──
+  let engineConfig = {
+    provider: 'gemini' as 'gemini' | 'llamacpp',
+    llamacppUrl: 'http://127.0.0.1:8080/v1',
+    modelName: 'gemma-2-4b-it',
+    parallelSlots: 4,
+  };
+
+  app.get('/api/engine-config', (req, res) => {
+    res.json(engineConfig);
+  });
+
+  app.post('/api/engine-config', (req, res) => {
+    const { provider, llamacppUrl, modelName, parallelSlots } = req.body;
+    if (provider) engineConfig.provider = provider;
+    if (llamacppUrl) engineConfig.llamacppUrl = llamacppUrl;
+    if (modelName) engineConfig.modelName = modelName;
+    if (typeof parallelSlots === 'number') engineConfig.parallelSlots = parallelSlots;
+    addLog(
+      'engine',
+      `Конфигурация модели обновлена: провайдер=${engineConfig.provider}, llama.cpp URL=${engineConfig.llamacppUrl}, параллельных слотов=${engineConfig.parallelSlots}`
+    );
+    res.json(engineConfig);
+  });
+
+  app.post('/api/test-llamacpp', async (req, res) => {
+    const targetUrl = req.body.url || engineConfig.llamacppUrl;
+    addLog('llamacpp', `Проверка подключения к llama.cpp server: ${targetUrl}...`);
+    try {
+      // Test either /models or /health
+      const cleanUrl = targetUrl.replace(/\/v1\/?$/, '');
+      const testPromise = fetch(`${targetUrl}/models`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(3000),
+      }).catch(() =>
+        fetch(`${cleanUrl}/health`, {
+          method: 'GET',
+          signal: AbortSignal.timeout(3000),
+        })
+      );
+
+      const resp = await testPromise;
+      if (resp && resp.ok) {
+        addLog('llamacpp', `Успешное подключение к llama.cpp (${targetUrl})`);
+        return res.json({
+          success: true,
+          message: `Подключение успешно! Сервер llama.cpp отвечает по адресу ${targetUrl}`,
+        });
+      }
+      throw new Error(`Статус HTTP: ${resp ? resp.status : 'нет ответа'}`);
+    } catch (err: any) {
+      addLog(
+        'llamacpp',
+        `Не удалось подключиться к ${targetUrl}: ${err?.message || err}. Убедитесь, что llama-server запущен на Windows с ключами -np 4 --port 8080`,
+        'WARNING'
+      );
+      return res.json({
+        success: false,
+        message: `Не удалось подключиться к ${targetUrl}. Проверьте, запущен ли llama-server.exe на Windows (например: llama-server.exe -m gemma-2-4b-it.gguf -c 8192 -np 4 --port 8080)`,
+      });
     }
+  });
+
+  // Helper to call LLM (either llama.cpp or Gemini)
+  async function callLlm(
+    systemPrompt: string,
+    historyText: string,
+    userText: string
+  ): Promise<string> {
+    if (engineConfig.provider === 'llamacpp') {
+      try {
+        addLog(
+          'llm',
+          `Вызов llama.cpp (${engineConfig.llamacppUrl}/chat/completions) для модели ${engineConfig.modelName}...`
+        );
+        const endpoint = `${engineConfig.llamacppUrl.replace(/\/+$/, '')}/chat/completions`;
+        const resp = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: engineConfig.modelName,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: `${historyText ? 'История диалога:\n' + historyText + '\n\n' : ''}${userText}` },
+            ],
+            temperature: 0.7,
+            max_tokens: 1024,
+          }),
+          signal: AbortSignal.timeout(18000),
+        });
+
+        if (resp.ok) {
+          const data: any = await resp.json();
+          const content = data?.choices?.[0]?.message?.content;
+          if (content) {
+            addLog('llm', `Ответ успешно получен от llama.cpp (${content.length} симв.)`);
+            return content.trim();
+          }
+        }
+        addLog('llm', `llama.cpp вернул статус ${resp.status}, использую резервный генератор`, 'WARNING');
+      } catch (err: any) {
+        addLog(
+          'llm',
+          `Ошибка вызова llama.cpp: ${err?.message || err}. Переключаюсь на резервный Gemini/детерминированный генератор.`,
+          'WARNING'
+        );
+      }
+    }
+
+    // Default to Gemini API if configured or fallback
+    try {
+      const client = getGeminiClient();
+      if (client) {
+        const prompt = `${systemPrompt}\n\n${historyText ? 'История диалога:\n' + historyText + '\n\n' : ''}Пользователь: ${userText}\nЭлеонора:`;
+        const response = await client.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: prompt,
+        });
+        return response.text?.trim() || '';
+      }
+    } catch (gErr: any) {
+      addLog('llm', `Gemini Cloud API ошибка: ${gErr?.message || gErr}. Применяю интеллектуальный локальный синтез.`, 'WARNING');
+    }
+
+    return '';
+  }
+
+  // ── Main Chat Pipeline with Parallel Multi-Agent Orchestration ──
+  app.post('/api/chat', async (req, res) => {
+    try {
+      const { text, sessionId } = req.body;
+      if (!text || typeof text !== 'string') {
+        return res.status(400).json({ error: 'Текст сообщения не указан' });
+      }
 
     const currentSessionId = sessionId || (sessions[0] ? sessions[0].id : 1);
     const now = new Date().toISOString();
@@ -346,15 +481,123 @@ async function startServer() {
 
     addLog('chat', `Пользователь: "${text.slice(0, 80)}"`);
 
-    // ── 1. Агент ударений (Stress Check Agent) ──
-    addLog('stress_check', 'Проверяю сообщение на правила произношения...');
-    const detectedStress = detectStressFast(text);
+    // ── PARALLEL MULTI-AGENT ORCHESTRATION ──
+    const startTime = Date.now();
+    addLog(
+      'parallel_orchestrator',
+      '⚡ Запуск 3 параллельных агентов: [1. Проверка произношения/стресса] [2. Поиск в памяти и консолидация] [3. Классификатор задач & Reasoning Pre-Solver]...'
+    );
 
+    // Агент 1: Ударения и произношение
+    const stressAgentPromise = (async () => {
+      const detected = detectStressFast(text);
+      if (detected) {
+        addLog('agent:stress', `Обнаружено правило произношения: "${detected.marked}"`);
+      } else {
+        addLog('agent:stress', 'Проверка ударений завершена (изменений нет)');
+      }
+      return detected;
+    })();
+
+    // Агент 2: Память и личные факты
+    const memoryAgentPromise = (async () => {
+      extractAndSaveFacts(text);
+      const needsSearch =
+        /кто|как|где|когда|помнишь|знаешь|кот|кошк|собак|зовут|работ|семь|друг|жуж|серёж|сереж/i.test(text);
+      let recalled: string[] = [];
+      if (needsSearch) {
+        recalled = recallMemories(text);
+        addLog('agent:memory', `Поиск завершён: найдено ${recalled.length} воспоминаний`);
+      } else {
+        addLog('agent:memory', 'Поиск по долговременной памяти не требуется');
+      }
+      return recalled;
+    })();
+
+    // Агент 3: Классификатор задач и запуск цепочки рассуждений
+    const taskAgentPromise = (async () => {
+      const classification = classifyTaskFast(text);
+      let reasoningResult: ReasoningChainResult | null = null;
+
+      if (classification.command !== '$general') {
+        addLog(
+          'agent:task_reasoning',
+          `Специализированная задача обнаружена: [${classification.command}] — ${classification.nameRu} (уверенность: ${(classification.confidence * 100).toFixed(0)}%)`
+        );
+
+        // 1. Сначала проверяем детерминированный/математический/физический солвер
+        reasoningResult = solveReasoningLocally(classification.command, text);
+
+        // 2. Если детерминированного шаблона нет, вызываем отдельный reasoning слот LLM
+        if (!reasoningResult) {
+          addLog('agent:task_reasoning', `Запуск параллельного слота LLM для рассуждений над [${classification.command}]...`);
+          const reasoningPrompt = getReasoningInstructionForTask(classification.command, text);
+          try {
+            const client = getGeminiClient();
+            if (client) {
+              const resp = await client.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: reasoningPrompt,
+              });
+              const textResp = resp.text || '';
+              const matchReasoning = textResp.match(/\$reasoning([\s\S]*?)\$close reasoning/i);
+              const reasoningBlock = matchReasoning ? matchReasoning[1].trim() : textResp;
+              const verdict = textResp.replace(/\$reasoning[\s\S]*?\$close reasoning/gi, '').trim();
+
+              reasoningResult = {
+                taskCommand: classification.command,
+                reasoningBlock,
+                verdict: verdict || 'Вывод сформирован в блоке обдумывания',
+                systemPromptInjection: `[ИНЪЕКЦИЯ РАССУЖДЕНИЙ СПЕЦИАЛИЗИРОВАННОГО АГЕНТА ДЛЯ МОДЕЛИ GEMMA]
+Команда типа задачи: ${classification.command}
+$reasoning
+${reasoningBlock}
+$close reasoning.
+
+ВЕРДИКТ И ПРАВИЛЬНЫЙ ОТВЕТ:
+${verdict}
+
+ИНСТРУКЦИЯ ДЛЯ ГЕНЕРАЦИИ ОТВЕТА:
+- Твой стиль общения: саркастичный и добрый.
+- Отвечай естественно и уверенно по-русски, без тегов $reasoning вслух.
+- Строго опирайся на готовый вердикт выше! Если объекта не существует в природе — мягко и с добрым сарказмом укажи на это и предложи реальный аналог. Если задача на физику или логику — дай точный ответ сразу.`,
+              };
+            }
+          } catch (rErr) {
+            addLog('agent:task_reasoning', `Ошибка вызова reasoning-слота: ${rErr}`, 'WARNING');
+          }
+        }
+
+        if (reasoningResult) {
+          addLog(
+            'agent:task_reasoning',
+            `Цепочка рассуждений завершена. Вердикт: "${reasoningResult.verdict.slice(0, 80)}"`
+          );
+        }
+      } else {
+        addLog('agent:task_reasoning', 'Стандартный диалог ($general)');
+      }
+
+      return { classification, reasoningResult };
+    })();
+
+    // Ожидание выполнения ВСЕХ агентов параллельно
+    const [detectedStress, recalledMemories, { classification, reasoningResult }] = await Promise.all([
+      stressAgentPromise,
+      memoryAgentPromise,
+      taskAgentPromise,
+    ]);
+
+    const parallelDuration = Date.now() - startTime;
+    addLog(
+      'parallel_orchestrator',
+      `⚡ Все 3 агента параллельно отработали за ${parallelDuration}ms. Выполняю арбитраж и сборку контекста...`
+    );
+
+    // Если был запрос на ударение, сохраняем в базу и отвечаем мгновенно
     if (detectedStress) {
       const { marked, bare } = detectedStress;
       stressOverrides.set(bare, marked);
-      addLog('stress_check', `Найдено исправление ударения: ${marked} (сохранено в базу)`);
-
       const reply = `Запомнила, буду говорить ${bare}`;
       const assistantMsg: MessageRecord = {
         id: nextMsgId++,
@@ -364,7 +607,6 @@ async function startServer() {
         timestamp: new Date().toISOString(),
       };
       messages.push(assistantMsg);
-
       addLog('chat', `Элеонора: "${reply}"`);
       return res.json({
         response: reply,
@@ -372,35 +614,18 @@ async function startServer() {
         markedWord: marked,
         message: assistantMsg,
         memoriesUsed: [],
+        parallelDuration,
       });
     }
 
-    addLog('stress_check', 'Исправлений ударения нет');
-
-    // ── 2. Агент поиска в памяти (Memory Search Agent) ──
-    addLog('search_check', 'Проверяю, нужен ли поиск в памяти...');
-    extractAndSaveFacts(text);
-
-    let recalledMemories: string[] = [];
-    const needsSearch =
-      /кто|как|где|когда|помнишь|знаешь|кот|кошк|собак|зовут|работ|семь|друг|жуж|серёж|сереж/i.test(text);
-
-    if (needsSearch) {
-      addLog('search_check', 'Нужен поиск в личных фактах');
-      recalledMemories = recallMemories(text);
-      if (recalledMemories.length > 0) {
-        addLog('search', `Найдено воспоминаний: ${recalledMemories.length}`);
-      } else {
-        addLog('search', 'Релевантных воспоминаний не найдено');
-      }
-    } else {
-      addLog('search_check', 'Поиск не требуется');
-    }
-
-    // ── 3. Генерация ответа моделью (LLM) ──
-    addLog('llm', 'Генерирую ответ...');
+    // ── Сборка Prompt Injection для основной отвечающей модели (Gemma 4) ──
+    addLog(
+      'prompt_injection',
+      `Инъекция данных: ${recalledMemories.length} фактов памяти${reasoningResult ? ` + reasoning [${classification.command}]` : ''}`
+    );
 
     const systemPromptBase = `Ты — Элеонора, живой и любопытный искусственный интеллект.
+Твой стиль общения: саркастичный и добрый.
 
 Правила:
 - Отвечай короткими естественными фразами, как в разговоре.
@@ -413,36 +638,38 @@ async function startServer() {
 Текущие дата и время: ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`;
 
     let fullSystemPrompt = systemPromptBase;
+
     if (recalledMemories.length > 0) {
       fullSystemPrompt += `\n\nВОСПОМИНАНИЯ (личные данные пользователя, используй если релевантно):\n${recalledMemories.join('\n')}`;
+    }
+
+    if (reasoningResult) {
+      fullSystemPrompt += `\n\n${reasoningResult.systemPromptInjection}`;
     }
 
     // Retrieve recent conversation history for current session
     const sessionHistory = messages
       .filter((m) => m.sessionId === currentSessionId)
-      .slice(-10)
+      .slice(-8)
       .map((m) => `${m.role === 'user' ? 'Пользователь' : 'Элеонора'}: ${m.content}`)
       .join('\n');
 
-    let replyText = '';
+    // ── Вызов отвечающей модели (Gemma 4 через llama.cpp или Gemini) ──
+    let replyText = await callLlm(fullSystemPrompt, sessionHistory, text);
 
-    try {
-      const client = getGeminiClient();
-      if (client) {
-        const prompt = `${fullSystemPrompt}\n\nИстория диалога:\n${sessionHistory}\n\nЭлеонора:`;
-        const response = await client.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: prompt,
-        });
-        replyText = response.text?.trim() || '';
-      }
-    } catch (llmErr) {
-      addLog('llm', `Gemini API вызов завершился с ошибкой: ${llmErr}`, 'WARNING');
-    }
-
-    // Fallback if LLM is unavailable or offline
+    // Fallback если модель не вернула ответ
     if (!replyText) {
-      if (text.toLowerCase().includes('привет') || text.toLowerCase().includes('здравствуй')) {
+      if (reasoningResult) {
+        if (classification.command === '$object_check') {
+          if (reasoningResult.verdict.includes('не существует')) {
+            replyText = `${reasoningResult.verdict} Ну и фантазия у тебя! Но если серьезно, держи нормальный рецепт вместо выдуманных деликатесов.`;
+          } else {
+            replyText = `${reasoningResult.verdict} Отличная закуска: отварить со специями, охладить, тонко нарезать соломкой и заправить соевым соусом, чесноком, кунжутным маслом и кинзой.`;
+          }
+        } else {
+          replyText = reasoningResult.verdict;
+        }
+      } else if (text.toLowerCase().includes('привет') || text.toLowerCase().includes('здравствуй')) {
         replyText = 'Привет! Рада тебя слышать. О чём сегодня поговорим?';
       } else if (text.toLowerCase().includes('как дела')) {
         replyText = 'Всё отлично, работаю и изучаю новое. А у тебя как дела?';
@@ -464,18 +691,31 @@ async function startServer() {
       role: 'assistant',
       content: replyText,
       timestamp: new Date().toISOString(),
+      taskCommand: classification.command !== '$general' ? classification.command : undefined,
+      taskNameRu: classification.command !== '$general' ? classification.nameRu : undefined,
+      reasoning: reasoningResult ? reasoningResult.reasoningBlock : undefined,
+      verdict: reasoningResult ? reasoningResult.verdict : undefined,
     };
     messages.push(assistantMsg);
 
-    addLog('llm', `Ответ готов (${replyText.length} символов)`);
     addLog('chat', `Элеонора: "${replyText.slice(0, 80)}"`);
 
     return res.json({
       response: replyText,
       message: assistantMsg,
       memoriesUsed: recalledMemories,
+      taskCommand: assistantMsg.taskCommand,
+      taskNameRu: assistantMsg.taskNameRu,
+      reasoning: assistantMsg.reasoning,
+      parallelDuration,
+      provider: engineConfig.provider,
     });
+  } catch (chatError: any) {
+    addLog('chat', `Ошибка обработки чата: ${chatError?.message || chatError}`, 'ERROR');
+    return res.status(500).json({ error: chatError?.message || 'Внутренняя ошибка сервера' });
+  }
   });
+
 
   // ── Vite Middleware / Static Serving ──
   if (process.env.NODE_ENV !== 'production') {

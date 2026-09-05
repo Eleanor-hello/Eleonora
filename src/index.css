@@ -1,16 +1,16 @@
 @import "tailwindcss";
 
 :root {
-  --bg: #0B0B16;
-  --surface: #131324;
-  --panel: #1A1A3E;
+  --bg: #060511;
+  --surface: #0E0C26;
+  --panel: #141133;
   --purple: #8B5CF6;
   --purple-hover: #7C3AED;
   --cyan: #06B6D4;
-  --text-main: #E2E8F0;
-  --text-muted: #8B8FA3;
-  --border: #1E1E4A;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --text-main: #F1F5F9;
+  --text-muted: #94A3B8;
+  --border: #231E56;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
 body {
@@ -19,20 +19,30 @@ body {
   color: var(--text-main);
   height: 100vh;
   width: 100vw;
+  overflow: hidden;
 }
 
 /* Custom scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 ::-webkit-scrollbar-track {
-  background: #131324;
+  background: rgba(11, 9, 30, 0.6);
 }
 ::-webkit-scrollbar-thumb {
-  background: #1E1E4A;
-  border-radius: 3px;
+  background: rgba(139, 92, 246, 0.35);
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #8B5CF6;
+  background: rgba(139, 92, 246, 0.7);
+}
+
+@keyframes pulse-slow {
+  0%, 100% { opacity: 0.3; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.04); }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 6s ease-in-out infinite;
 }

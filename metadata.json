@@ -1,6 +1,6 @@
 {
   "name": "Eleonora",
-  "description": "AI companion with chat, memory search, stress correction, speech synthesis, and agent telemetry",
+  "description": "AI companion with task classifier agent ($spatial_analysis, $object_check, $logic_conflicts, $theory_of_mind), reasoning injection for Gemma 4, stress correction, speech synthesis, and telemetry",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

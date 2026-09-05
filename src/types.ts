@@ -4,6 +4,10 @@ export interface Message {
   content: string;
   timestamp: string;
   sessionId?: number;
+  taskCommand?: string;
+  taskNameRu?: string;
+  reasoning?: string;
+  verdict?: string;
 }
 
 export interface ChatSession {
@@ -32,4 +36,11 @@ export interface StressOverride {
   bare: string;
   marked: string;
   addedAt?: string;
+}
+
+export interface EngineConfig {
+  provider: 'gemini' | 'llamacpp';
+  llamacppUrl: string;
+  modelName: string;
+  parallelSlots: number;
 }
